@@ -496,6 +496,8 @@ To create a dedicated partition for **300–400**, follow these steps.
 ```sql
 ALTER TABLE emp
 DETACH PARTITION emp_3;
+
+alter table emp_3 rename to old_emp_3;
 ```
 
 `emp_3` is now a standalone table.

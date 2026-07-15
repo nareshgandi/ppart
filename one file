@@ -1,0 +1,479 @@
+List partition
+-------------------
+
+create table emp (id int,sal int) partition by list (id);
+
+create table emp_1 partition of emp for values IN (1,4,6);
+create table emp_2 partition of emp for values IN (2,3,5);
+create table emp_3 partition of emp for values IN (8,9);
+
+insert into emp values(1,100);
+insert into emp values(2,100);
+
+\d+ emp
+
+insert into emp values(10,100);
+
+Range Partition
+-------------------
+
+create table emp(id int, sal int) partition by range (id);
+create table emp_1 partition of emp for values from (1) to (100);
+create table emp_2 partition of emp for values from (100) to (200);
+create table emp_3 partition of emp for values from (200) to (MAXVALUE);
+
+
+Hash partition
+-----------------
+
+create table emp (id int,sal int) partition by hash (id);
+create table emp_1 partition of emp for values with (modulus 3,remainder 0);
+create table emp_2 partition of emp for values with (modulus 3,remainder 1);
+create table emp_3 partition of emp for values with (modulus 3,remainder 2);
+
+INSERT INTO  emp SELECT generate_series(1, 100000);
+
+SELECT relname, count(*) FROM emp
+JOIN pg_class ON emp.tableoid=pg_class.oid
+GROUP BY 1;
+
+Default partition
+----------------------
+
+
+
+create table emp (id int,sal int) partition by list (id);
+
+create table emp_1 partition of emp for values IN (1,4,6);
+create table emp_2 partition of emp for values IN (2,3,5);
+create table emp_3 partition of emp for values IN (8,9);
+
+CREATE TABLE emp_others PARTITION OF emp DEFAULT ;
+
+insert into emp values(32432,3423);
+
+CREATE TABLE emp_4 (LIKE emp INCLUDING ALL) ;
+
+ALTER TABLE emp ATTACH PARTITION emp_4 FOR VALUES IN (32432) ;
+
+postgres=# ALTER TABLE emp ATTACH PARTITION emp_4 FOR VALUES IN (7) ;
+ERROR:  updated partition constraint for default partition "emp_others" would be violated by some row
+postgres=#
+
+alter table emp_4 add constraint emp_4_ck check (id is not null and id = 7);
+
+begin;
+insert into emp_4 select * from emp_default where id=7;
+delete from emp_default where id=7;
+ALTER TABLE emp ATTACH PARTITION emp_4 FOR VALUES IN (7) ;
+commit;
+
+ALTER TABLE emp_4 DROP CONSTRAINT emp_4_ck;
+
+SELECT tableoid::regclass AS partition_name, *
+FROM emp
+ORDER BY id;
+
+
+pt=# SELECT
+    c.relname,
+    pg_get_expr(c.relpartbound, c.oid) AS partition_bound
+FROM pg_class c
+WHERE c.relname = 'emp_4';
+ relname |  partition_bound
+---------+-------------------
+ emp_4   | FOR VALUES IN (7)
+(1 row)
+
+pt=#
+
+
+Detaching a table
+-----------------
+
+ALTER TABLE emp DETACH PARTITION emp_4;
+
+
+-- Drop it if it exists so we start fresh
+DROP TABLE IF EXISTS orders_flat CASCADE;
+
+-- Create the single large table
+CREATE TABLE orders_flat (
+    id BIGSERIAL PRIMARY KEY,       -- Unique ID
+    order_date TIMESTAMP NOT NULL,  -- We will eventually RANGE partition on this
+    customer_id INT NOT NULL,       -- We could HASH partition on this
+    region TEXT NOT NULL,           -- We could LIST partition on this
+    amount NUMERIC(10,2),
+    details TEXT                    -- Padding to make the table size large (2GB)
+);
+
+-- Create standard indexes (as you would have in production)
+-- These indexes will become large and slow as data grows
+CREATE INDEX idx_orders_date ON orders_flat(order_date);
+CREATE INDEX idx_orders_region ON orders_flat(region);
+
+-- This query acts as a data generator. 
+-- It may take 30-60 seconds to run depending on your disk speed.
+INSERT INTO orders_flat (order_date, customer_id, region, amount, details)
+SELECT
+    -- Random date between Jan 1, 2023 and Jan 1, 2024
+    TIMESTAMP '2023-01-01' + random() * (TIMESTAMP '2024-01-01' - TIMESTAMP '2023-01-01'),
+    
+    -- Random customer ID between 1 and 100,000
+    floor(random() * 100000) + 1,
+    
+    -- Random Region (US, EU, ASIA, OTHER)
+    (ARRAY['US', 'EU', 'ASIA', 'OTHER'])[floor(random() * 4 + 1)],
+    
+    -- Random dollar amount
+    round((random() * 1000)::numeric, 2),
+    
+    -- 200 bytes of "garbage" text to inflate size
+    repeat('x', 200)
+FROM generate_series(1, 1000000); -- Generates 10 Million rows
+
+-- 1. Check the total count (Should be 10,000,000)
+SELECT count(*) FROM orders_flat;
+
+-- 2. Check the table size (Should be approx ~2GB)
+SELECT pg_size_pretty(pg_total_relation_size('orders_flat'));
+
+-- 3. Check a sample row
+SELECT * FROM orders_flat LIMIT 5;
+
+
+-- 1. Create the Parent Table
+CREATE TABLE orders_range (
+    id BIGINT,              -- Note: We removed SERIAL (we will copy existing IDs)
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT
+) PARTITION BY RANGE (order_date);
+
+-- 2. Create Partitions (Quarterly)
+-- Range partitions must be defined manually or they will reject data.
+CREATE TABLE orders_range_2023_q1 PARTITION OF orders_range
+    FOR VALUES FROM ('2023-01-01') TO ('2023-04-01');
+
+CREATE TABLE orders_range_2023_q2 PARTITION OF orders_range
+    FOR VALUES FROM ('2023-04-01') TO ('2023-07-01');
+
+CREATE TABLE orders_range_2023_q3 PARTITION OF orders_range
+    FOR VALUES FROM ('2023-07-01') TO ('2023-10-01');
+
+CREATE TABLE orders_range_2023_q4 PARTITION OF orders_range
+    FOR VALUES FROM ('2023-10-01') TO ('2024-01-01');
+
+-- 3. The Migration (Copy Data)
+-- Postgres automatically routes rows to the correct Q1/Q2/Q3/Q4 table
+INSERT INTO orders_range SELECT * FROM orders_flat;
+
+
+-- 1. Create the Parent Table
+CREATE TABLE orders_list (
+    id BIGINT,
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT
+) PARTITION BY LIST (region);
+
+-- 2. Create Partitions (Explicit Values)
+-- Every value in your data MUST match one of these lists.
+CREATE TABLE orders_list_us PARTITION OF orders_list 
+    FOR VALUES IN ('US');
+
+CREATE TABLE orders_list_eu PARTITION OF orders_list 
+    FOR VALUES IN ('EU');
+
+CREATE TABLE orders_list_asia PARTITION OF orders_list 
+    FOR VALUES IN ('ASIA');
+
+-- Catch-all for any region not listed above (optional but recommended)
+CREATE TABLE orders_list_default PARTITION OF orders_list DEFAULT;
+
+-- 3. The Migration (Copy Data)
+INSERT INTO orders_list SELECT * FROM orders_flat;
+
+
+-- 1. Create the Parent Table
+CREATE TABLE orders_hash (
+    id BIGINT,
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT
+) PARTITION BY HASH (customer_id);
+
+-- 2. Create Partitions (Modulus)
+-- We create 4 buckets. Postgres hashes the customer_id and assigns it to 0, 1, 2, or 3.
+CREATE TABLE orders_hash_p0 PARTITION OF orders_hash FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE orders_hash_p1 PARTITION OF orders_hash FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE orders_hash_p2 PARTITION OF orders_hash FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE orders_hash_p3 PARTITION OF orders_hash FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+-- 3. The Migration (Copy Data)
+INSERT INTO orders_hash SELECT * FROM orders_flat;
+
+explain analyze SELECT sum(amount) 
+FROM orders_flat 
+WHERE region='US'
+
+explain analyze SELECT sum(amount) 
+FROM orders_list
+WHERE region='US';
+
+
+SELECT sum(amount) 
+FROM orders_range
+WHERE order_date >= '2023-03-01' AND order_date < '2023-04-01';
+
+Online Migration: Converting orders_flat to LIST-Partitioned Table (Zero Downtime)
+This document describes a production-tested, online migration approach to convert a large, non-partitioned PostgreSQL table into a LIST-partitioned table with no application downtime.
+
+Key idea: Keep the application writing to the old table, mirror changes via triggers, backfill historical data, then atomically swap tables.
+
+Table Definition (Source)
+CREATE TABLE orders_flat (
+    id BIGSERIAL PRIMARY KEY,
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT
+);
+⚠️ Important PostgreSQL Rule
+For partitioned tables, PostgreSQL requires:
+
+Every PRIMARY KEY or UNIQUE constraint must include the partition key.
+
+Since we partition by region, the new table must use:
+
+PRIMARY KEY (id, region)
+This change is applied only to the new partitioned table, not the source table.
+
+✅ ONLINE MIGRATION PLAN (Zero Downtime)
+Overview
+Create a new partitioned table (orders_list)
+Create partitions
+Create trigger to mirror INSERT / UPDATE / DELETE
+Backfill historical data in batches
+Atomically swap tables
+STEP 1️⃣ Create the NEW Partitioned Table (Empty)
+CREATE TABLE orders_list (
+    id BIGINT NOT NULL,
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT,
+    CONSTRAINT orders_list_pk PRIMARY KEY (id, region)
+) PARTITION BY LIST (region);
+STEP 2️⃣ Create Partitions
+CREATE TABLE orders_list_us
+PARTITION OF orders_list
+FOR VALUES IN ('US');
+
+CREATE TABLE orders_list_eu
+PARTITION OF orders_list
+FOR VALUES IN ('EU');
+
+CREATE TABLE orders_list_asia
+PARTITION OF orders_list
+FOR VALUES IN ('ASIA');
+
+CREATE TABLE orders_list_default
+PARTITION OF orders_list
+DEFAULT;
+STEP 3️⃣ Create Supporting Indexes (Optional but Recommended)
+CREATE INDEX ON orders_list (order_date);
+CREATE INDEX ON orders_list (customer_id);
+PostgreSQL automatically creates matching indexes on all partitions.
+
+STEP 4️⃣ Create the Trigger Function (CRITICAL STEP)
+This function mirrors INSERT / UPDATE / DELETE operations from orders_flat into orders_list.
+
+CREATE OR REPLACE FUNCTION duplicate_orders_to_partitioned()
+RETURNS TRIGGER AS
+$$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO orders_list VALUES (NEW.*);
+        RETURN NEW;
+
+    ELSIF TG_OP = 'UPDATE' THEN
+        INSERT INTO orders_list VALUES (NEW.*)
+        ON CONFLICT (id, region)
+        DO UPDATE SET
+            order_date  = EXCLUDED.order_date,
+            customer_id = EXCLUDED.customer_id,
+            amount      = EXCLUDED.amount,
+            details     = EXCLUDED.details;
+        RETURN NEW;
+
+    ELSIF TG_OP = 'DELETE' THEN
+        DELETE FROM orders_list
+        WHERE id = OLD.id
+          AND region = OLD.region;
+        RETURN OLD;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+STEP 5️⃣ Attach Trigger to Source Table
+CREATE TRIGGER trg_orders_dual_write
+AFTER INSERT OR UPDATE OR DELETE
+ON orders_flat
+FOR EACH ROW
+EXECUTE FUNCTION duplicate_orders_to_partitioned();
+📌 From this point onward:
+
+Application continues using orders_flat
+orders_list stays fully in sync
+STEP 6️⃣ Backfill Historical Data (ONLINE)
+One-time Bulk Insert
+INSERT INTO orders_list
+SELECT * FROM orders_flat
+ON CONFLICT (id, region) DO NOTHING;
+Recommended: Batched Backfill (Large Tables)
+INSERT INTO orders_list
+SELECT *
+FROM orders_flat
+WHERE id > :last_id
+ORDER BY id
+LIMIT 50000
+ON CONFLICT (id, region) DO NOTHING;
+Repeat until all rows are migrated.
+
+STEP 7️⃣ Validation (Do Not Skip)
+-- Row count check
+SELECT count(*) FROM orders_flat;
+SELECT count(*) FROM orders_list;
+
+-- Spot check
+SELECT * FROM orders_list WHERE region = 'US' LIMIT 10;
+STEP 8️⃣ Atomic Table Swap (Milliseconds of Lock)
+BEGIN;
+
+ALTER TABLE orders_flat RENAME TO orders_flat_old;
+ALTER TABLE orders_list RENAME TO orders_flat;
+
+COMMIT;
+📌 Downtime is typically milliseconds (metadata lock only).
+
+STEP 9️⃣ Cleanup
+DROP TRIGGER trg_orders_dual_write ON orders_flat_old;
+DROP FUNCTION duplicate_orders_to_partitioned();
+Optional:
+
+DROP TABLE orders_flat_old;
+⚠️ UPSERT WARNING (VERY IMPORTANT)
+After migration, the live table has:
+
+PRIMARY KEY (id, region)
+❌ This will FAIL
+INSERT INTO orders_flat (id, order_date, customer_id)
+VALUES (...)
+ON CONFLICT (id) DO UPDATE ...;
+✅ Correct UPSERT
+INSERT INTO orders_flat (id, region, order_date, customer_id)
+VALUES (...)
+ON CONFLICT (id, region) DO UPDATE ...;
+
+CREATE SCHEMA partman;
+CREATE EXTENSION pg_partman SCHEMA partman;
+
+CREATE TABLE orders_range (
+    id BIGINT NOT NULL,
+    order_date TIMESTAMP NOT NULL,
+    customer_id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount NUMERIC(10,2),
+    details TEXT
+) PARTITION BY RANGE (order_date);
+
+3️⃣ Register the parent with pg_partman
+
+SELECT partman.create_parent(
+    p_parent_table => 'public.orders_range',
+    p_control      => 'order_date',
+    p_type         => 'range',
+    p_interval     => '3 months',      -- Quarterly
+    p_premake      => 4,               -- Create future partitions
+        p_start_partition => '2023-01-01'
+);
+
+CREATE INDEX ON orders_range (customer_id);
+CREATE INDEX ON orders_range (region);
+
+CREATE OR REPLACE FUNCTION duplicate_orders_to_range_partitions()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- INSERT
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO orders_range
+        VALUES (NEW.*);
+        RETURN NEW;
+    END IF;
+
+    -- UPDATE
+    IF TG_OP = 'UPDATE' THEN
+        -- If partition key changed, move row
+        IF NEW.order_date <> OLD.order_date THEN
+            DELETE FROM orders_range
+            WHERE id = OLD.id
+              AND order_date = OLD.order_date;
+
+            INSERT INTO orders_range
+            VALUES (NEW.*);
+        ELSE
+            -- Same partition, simple update
+            UPDATE orders_range
+            SET
+                customer_id = NEW.customer_id,
+                region      = NEW.region,
+                amount      = NEW.amount,
+                details     = NEW.details
+            WHERE id = OLD.id
+              AND order_date = OLD.order_date;
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- DELETE
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM orders_range
+        WHERE id = OLD.id
+          AND order_date = OLD.order_date;
+        RETURN OLD;
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+
+CREATE TRIGGER trg_orders_range_dual_write
+AFTER INSERT OR UPDATE OR DELETE
+ON orders_flat
+FOR EACH ROW
+EXECUTE FUNCTION duplicate_orders_to_range_partitions();
+
+INSERT INTO orders_range
+SELECT * FROM orders_flat;
+
+SELECT count(*) FROM orders_flat;
+SELECT count(*) FROM orders_range;
+
+BEGIN;
+
+ALTER TABLE orders_flat RENAME TO orders_flat_old;
+ALTER TABLE orders_range RENAME TO orders_flat;
+
+COMMIT;
